@@ -22,6 +22,21 @@ uint16_t last_retransmit_seq = 0;
 #define FAST_RETRANSMIT_THRESHOLD 3
 #define MAX_RETRANSMIT_ATTEMPTS 5
 
+typedef struct {
+    packet packets[BUFFER_SIZE];
+    struct timeval times[BUFFER_SIZE];
+    unsigned int retransmit_count[BUFFER_SIZE];
+    unsigned int count;
+    uint16_t window_start;
+    uint16_t window_size;
+} Buffer;
+
+Buffer send_buffer = {.count = 0, .window_start = 0, .window_size = MAX_WINDOW};
+Buffer recv_buffer = {.count = 0, .window_start = 0, .window_size = MAX_WINDOW};
+
+ssize_t (*input_p)(uint8_t *, size_t);
+void (*output_p)(uint8_t *, size_t);
+
 // Function declarations
 void calculate_parity(packet *pkt);
 bool check_parity(packet *pkt);
@@ -198,22 +213,6 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type, uint16_t 
 }
 
 
-typedef struct
-{
-    packet packets[BUFFER_SIZE];
-    struct timeval times[BUFFER_SIZE];
-    int retransmit_count[BUFFER_SIZE]; // Track retransmission attempts
-    int count;
-    uint16_t window_start; // Sequence number of first packet in window
-    uint16_t window_size;  // Current window size
-} Buffer;
-
-Buffer send_buffer = {.count = 0, .window_start = 0, .window_size = MAX_WINDOW};
-Buffer recv_buffer = {.count = 0, .window_start = 0, .window_size = MAX_WINDOW};
-
-ssize_t (*input_p)(uint8_t *, size_t);
-void (*output_p)(uint8_t *, size_t);
-
 // Buffer operations
 bool buffer_add(Buffer *buf, packet *pkt)
 {
@@ -279,139 +278,113 @@ void process_data(packet *pkt) {
 
     fprintf(stderr, "Processing data packet seq=%hu, expected ack=%hu\n", recv_seq, ack);
 
-    // Special case for the first packet
+    // First packet case
     if (ack == 0) {
-        // Find the lowest sequence number we've received
-        uint16_t min_seq = recv_seq;
-        for (int i = 0; i < recv_buffer.count; i++) {
-            uint16_t buf_seq = ntohs(recv_buffer.packets[i].seq);
-            if (buf_seq < min_seq) {
-                min_seq = buf_seq;
-            }
-        }
-
-        // If this is the lowest sequence we've seen, write it
-        if (recv_seq == min_seq) {
-            fprintf(stderr, "Writing first packet seq=%hu len=%hu\n", recv_seq, recv_len);
-            output_p(pkt->payload, recv_len);
-            ack = recv_seq + recv_len;
-
-            // Now check buffered packets for sequential packets
-            bool found = true;
-            while (found && recv_buffer.count > 0) {
-                found = false;
-                for (int i = 0; i < recv_buffer.count; i++) {
-                    uint16_t buf_seq = ntohs(recv_buffer.packets[i].seq);
-                    if (buf_seq == ack) {
-                        uint16_t buf_len = ntohs(recv_buffer.packets[i].length);
-                        fprintf(stderr, "Writing buffered packet seq=%hu len=%hu\n", buf_seq, buf_len);
-                        output_p(recv_buffer.packets[i].payload, buf_len);
-                        ack += buf_len;
-
-                        // Remove from buffer
-                        for (int j = i; j < recv_buffer.count - 1; j++) {
-                            memcpy(&recv_buffer.packets[j], &recv_buffer.packets[j + 1],
-                                   sizeof(packet) + MAX_PAYLOAD);
-                        }
-                        recv_buffer.count--;
-                        found = true;
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Buffer this packet if it's not the lowest
-            if (recv_buffer.count < BUFFER_SIZE) {
-                fprintf(stderr, "Buffering packet seq=%hu (waiting for earlier packets)\n", recv_seq);
-                memcpy(&recv_buffer.packets[recv_buffer.count], pkt,
-                       sizeof(packet) + recv_len);
-                recv_buffer.count++;
-            }
-        }
+        output_p(pkt->payload, recv_len);
+        ack = recv_seq + recv_len;
         return;
     }
 
-    // Normal case for subsequent packets
+    // Expected packet case
     if (recv_seq == ack) {
-        fprintf(stderr, "Writing packet seq=%hu len=%hu\n", recv_seq, recv_len);
         output_p(pkt->payload, recv_len);
         ack += recv_len;
 
-        // Check for buffered packets that can now be processed
-        bool found = true;
-        while (found && recv_buffer.count > 0) {
+        // Process buffered packets in sequence
+        bool found;
+        do {
             found = false;
             for (int i = 0; i < recv_buffer.count; i++) {
                 uint16_t buf_seq = ntohs(recv_buffer.packets[i].seq);
                 if (buf_seq == ack) {
                     uint16_t buf_len = ntohs(recv_buffer.packets[i].length);
-                    fprintf(stderr, "Writing buffered packet seq=%hu len=%hu\n", buf_seq, buf_len);
                     output_p(recv_buffer.packets[i].payload, buf_len);
                     ack += buf_len;
-
-                    // Remove from buffer
+                    
+                    // Remove processed packet from buffer
                     for (int j = i; j < recv_buffer.count - 1; j++) {
-                        memcpy(&recv_buffer.packets[j], &recv_buffer.packets[j + 1],
-                               sizeof(packet) + MAX_PAYLOAD);
+                        recv_buffer.packets[j] = recv_buffer.packets[j + 1];
                     }
                     recv_buffer.count--;
                     found = true;
                     break;
                 }
             }
+        } while (found && recv_buffer.count > 0);
+    }
+    // Out of order packet - buffer if within window
+    else if (recv_seq > ack && recv_seq < ack + recv_buffer.window_size) {
+        // Check if we already have this packet
+        for (int i = 0; i < recv_buffer.count; i++) {
+            if (ntohs(recv_buffer.packets[i].seq) == recv_seq) {
+                return; // Already buffered
+            }
         }
-    } else if (recv_seq > ack && recv_seq < ack + recv_buffer.window_size) {
-        // Future packet - buffer it
+        
         if (recv_buffer.count < BUFFER_SIZE) {
-            fprintf(stderr, "Buffering out-of-order packet seq=%hu\n", recv_seq);
             memcpy(&recv_buffer.packets[recv_buffer.count], pkt,
                    sizeof(packet) + recv_len);
             recv_buffer.count++;
         }
     }
+
+    // Always send an ACK with current expected sequence number
+    packet ack_pkt = {0};
+    ack_pkt.seq = htons(seq);
+    ack_pkt.ack = htons(ack);
+    ack_pkt.length = 0;
+    ack_pkt.win = htons(MAX_WINDOW - recv_buffer.count * MAX_PAYLOAD);
+    ack_pkt.flags = ACK;
+    calculate_parity(&ack_pkt);
+    send_packet(sockfd, addr, &ack_pkt);
 }
 
-
-void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
-{
-    if (index < 0 || index >= send_buffer.count)
+void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index) {
+    if (index < 0 || index >= send_buffer.count) {
         return;
+    }
 
     packet *pkt = &send_buffer.packets[index];
     uint16_t seq_num = ntohs(pkt->seq);
+    uint16_t pkt_len = ntohs(pkt->length);
 
-    // Check if packet is already acknowledged
-    if (seq_num + ntohs(pkt->length) <= last_ack)
-    {
+    // Don't retransmit if already acknowledged
+    if (seq_num + pkt_len <= last_ack) {
         return;
     }
 
-    if (send_buffer.retransmit_count[index] < MAX_RETRANSMIT_ATTEMPTS)
-    {
-        send_packet(sockfd, addr, pkt);
-        gettimeofday(&send_buffer.times[index], NULL);
-        send_buffer.retransmit_count[index]++;
-
-        fprintf(stderr, "[%s] Retransmitting seq=%hu (attempt %d)\n",
-                state == SERVER ? "SERVER" : "CLIENT",
-                seq_num, send_buffer.retransmit_count[index]);
+    // Check retransmission limit
+    if (send_buffer.retransmit_count[index] >= MAX_RETRANSMIT_ATTEMPTS) {
+        fprintf(stderr, "Max retransmission attempts reached for seq=%hu\n", seq_num);
+        return;
     }
+
+    // Update window size and flags before retransmission
+    pkt->win = htons(MAX_WINDOW - recv_buffer.count * MAX_PAYLOAD);
+    calculate_parity(pkt);
+    
+    send_packet(sockfd, addr, pkt);
+    gettimeofday(&send_buffer.times[index], NULL);
+    send_buffer.retransmit_count[index]++;
 }
 
 void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack) {
-    if (received_ack <= last_ack) {
-        if (received_ack == last_ack) {
-            dup_ack_count++;
-            if (dup_ack_count >= DUP_ACKS) {
-                // Fast retransmit
-                for (int i = 0; i < send_buffer.count; i++) {
-                    if (ntohs(send_buffer.packets[i].seq) == last_ack) {
-                        retransmit_packet(sockfd, addr, i);
-                        break;
-                    }
+    if (received_ack < last_ack) {
+        return;
+    }
+
+    if (received_ack == last_ack) {
+        dup_ack_count++;
+        if (dup_ack_count == FAST_RETRANSMIT_THRESHOLD) {
+            // Fast retransmit only the first unacknowledged packet
+            for (int i = 0; i < send_buffer.count; i++) {
+                if (ntohs(send_buffer.packets[i].seq) == last_ack) {
+                    send_buffer.window_size = MAX(MIN_WINDOW, send_buffer.window_size / 2);
+                    retransmit_packet(sockfd, addr, i);
+                    break;
                 }
-                dup_ack_count = 0;
             }
+            dup_ack_count = 0;
         }
         return;
     }
@@ -420,7 +393,7 @@ void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack) {
     last_ack = received_ack;
     dup_ack_count = 0;
 
-    // Remove acknowledged packets from send buffer
+    // Remove acknowledged packets
     while (send_buffer.count > 0) {
         packet *first_pkt = &send_buffer.packets[0];
         if (ntohs(first_pkt->seq) + ntohs(first_pkt->length) <= received_ack) {
@@ -429,20 +402,30 @@ void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack) {
             break;
         }
     }
-}
 
-void handle_timeout(int sockfd, struct sockaddr_in *addr, struct timeval now)
-{
-    for (int i = 0; i < send_buffer.count; i++)
-    {
-        // Only retransmit packets that haven't been acknowledged
+    // Gradually increase window
+    if (send_buffer.window_size < MAX_WINDOW) {
+        send_buffer.window_size += MAX_PAYLOAD;
+    }
+}
+void handle_timeout(int sockfd, struct sockaddr_in *addr, struct timeval now) {
+    if (send_buffer.count == 0) {
+        return;
+    }
+
+    // Only retransmit first unacknowledged packet on timeout
+    for (int i = 0; i < send_buffer.count; i++) {
         uint16_t seq_num = ntohs(send_buffer.packets[i].seq);
         uint16_t len = ntohs(send_buffer.packets[i].length);
 
-        if (seq_num + len > last_ack &&
-            TV_DIFF(now, send_buffer.times[i]) >= RTO)
-        {
-            retransmit_packet(sockfd, addr, i);
+        if (seq_num + len > last_ack) {
+            if (TV_DIFF(now, send_buffer.times[i]) >= RTO) {
+                // Reduce window size on timeout
+                send_buffer.window_size = MAX(MIN_WINDOW, send_buffer.window_size / 2);
+                retransmit_packet(sockfd, addr, i);
+                break;  // Only retransmit one packet per timeout
+            }
+            break;
         }
     }
 }
