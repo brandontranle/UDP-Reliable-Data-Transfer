@@ -17,10 +17,17 @@ uint32_t ack = 0;
 uint16_t last_ack = 0;
 int dup_ack_count = 0;
 uint16_t last_retransmit_seq = 0;
+uint16_t recv_flow_window;
+
 
 #define BUFFER_SIZE 40
 #define FAST_RETRANSMIT_THRESHOLD 3
 #define MAX_RETRANSMIT_ATTEMPTS 5
+
+static inline int16_t seq_diff(uint16_t a, uint16_t b) {
+    return (int16_t)(a - b);
+}
+
 
 // ---------- FORWARD DECLARATIONS ----------
 void calculate_parity(packet *pkt);
@@ -76,7 +83,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                 print_diag(&syn_pkt, SEND);
                 send_packet(sockfd, addr, &syn_pkt);
 
-                fprintf(stderr, "CLIENT: Sending SYN, seq=%hu\n", *local_init_seq);
+                //fprintf(stderr, "CLIENT: Sending SYN, seq=%hu\n", *local_init_seq);
                 handshake_state = HS_SYN_SENT;
                 gettimeofday(&timeout, NULL);
 
@@ -101,7 +108,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                         print_diag(recv_pkt, RECV);
 
                         if (!check_parity(recv_pkt)) {
-                            fprintf(stderr, "CLIENT: Corrupted handshake packet, dropping\n");
+                            //fprintf(stderr, "CLIENT: Corrupted handshake packet, dropping\n");
                             continue;
                         }
                         // Check if it's SYN+ACK
@@ -120,10 +127,12 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
 
                             calculate_parity(&ack_pkt);
                             send_packet(sockfd, addr, &ack_pkt);
-
+                            
+                            /*
                             fprintf(stderr, "CLIENT: Sending final ACK, seq=%hu, ack=%hu\n",
                                     (*local_init_seq + 1),
                                     (*remote_init_seq + 1));
+                            */
                             handshake_state = HS_ESTABLISHED;
                         }
                     }
@@ -161,7 +170,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                 print_diag(recv_pkt, RECV);
 
                 if (!check_parity(recv_pkt)) {
-                    fprintf(stderr, "SERVER: Corrupted handshake packet, dropping\n");
+                    //fprintf(stderr, "SERVER: Corrupted handshake packet, dropping\n");
                     continue;
                 }
 
@@ -181,10 +190,12 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
 
                     calculate_parity(&synack_pkt);
                     send_packet(sockfd, addr, &synack_pkt);
-
+                    
+                    /*
                     fprintf(stderr, "SERVER: Sending SYN-ACK, seq=%hu, ack=%hu\n",
                             *local_init_seq,
                             (*remote_init_seq + 1));
+                    */
                     handshake_state = HS_SYN_RECEIVED;
                     gettimeofday(&timeout, NULL);
                 }
@@ -192,7 +203,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                     // Final ACK
                     uint16_t their_ack = ntohs(recv_pkt->ack);
                     if (their_ack == (*local_init_seq + 1)) {
-                        fprintf(stderr, "SERVER: Received final ACK, handshake complete\n");
+                        //fprintf(stderr, "SERVER: Received final ACK, handshake complete\n");
                         handshake_state = HS_ESTABLISHED;
                     }
                 }
@@ -203,7 +214,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                 struct timeval now;
                 gettimeofday(&now, NULL);
                 if (TV_DIFF(now, timeout) >= RTO) {
-                    fprintf(stderr, "SERVER: Handshake timeout, restarting\n");
+                    //fprintf(stderr, "SERVER: Handshake timeout, restarting\n");
                     handshake_state = HS_INIT;
                 }
             }
@@ -213,10 +224,20 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
     return true;
 }
 
-// ------------- BUFFER STRUCTS (SEND & RECV) -------------
-typedef struct
-{
-    packet packets[BUFFER_SIZE];
+// At the top of transport.c, after includes, add:
+typedef struct {
+    uint16_t seq;
+    uint16_t ack;
+    uint16_t length;
+    uint16_t win;
+    uint16_t flags; // LSb 0 SYN, LSb 1 ACK, LSb 2 PARITY
+    uint16_t unused;
+    uint8_t payload[MAX_PAYLOAD];  // allocate full payload space
+} full_packet;
+
+// Then update your Buffer definitions:
+typedef struct {
+    full_packet packets[BUFFER_SIZE];
     struct timeval times[BUFFER_SIZE];
     int retransmit_count[BUFFER_SIZE];
     int count;
@@ -234,7 +255,9 @@ void (*output_p)(uint8_t *, size_t);
 bool buffer_add(Buffer *buf, packet *pkt)
 {
     if (buf->count >= BUFFER_SIZE) return false;
-    memcpy(&buf->packets[buf->count], pkt, sizeof(packet) + ntohs(pkt->length));
+    size_t pkt_size = sizeof(packet) + ntohs(pkt->length); 
+    // Copy into our full_packet buffer (we have enough room because payload is fixed size)
+    memcpy(&buf->packets[buf->count], pkt, pkt_size);
     gettimeofday(&buf->times[buf->count], NULL);
     buf->retransmit_count[buf->count] = 0;
     buf->count++;
@@ -245,12 +268,14 @@ void buffer_remove_first(Buffer *buf)
 {
     if (buf->count <= 0) return;
     for (int i = 0; i < buf->count - 1; i++) {
-        buf->packets[i] = buf->packets[i + 1];
+        memmove(&buf->packets[i], &buf->packets[i + 1], sizeof(full_packet));
         buf->times[i] = buf->times[i + 1];
         buf->retransmit_count[i] = buf->retransmit_count[i + 1];
     }
     buf->count--;
 }
+
+
 
 bool is_in_window(uint16_t seq_num, uint16_t window_start, uint16_t window_size)
 {
@@ -280,7 +305,7 @@ void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
 {
     if (index < 0 || index >= send_buffer.count) return;
 
-    packet *pkt = &send_buffer.packets[index];
+    packet *pkt = (packet *)&send_buffer.packets[index];
     uint16_t seq_num = ntohs(pkt->seq);
     uint16_t length = ntohs(pkt->length);
 
@@ -293,25 +318,23 @@ void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
         gettimeofday(&send_buffer.times[index], NULL);
         send_buffer.retransmit_count[index]++;
 
+        /*
         fprintf(stderr, "[%s] Retransmitting seq=%hu (attempt %d)\n",
                 (state == SERVER ? "SERVER" : "CLIENT"),
                 seq_num, send_buffer.retransmit_count[index]);
+        */
     }
 }
-
 void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack)
 {
-    // If ack <= last_ack, maybe duplicate
-    if (received_ack <= last_ack) {
+    // If ack is not greater than last_ack, treat it as duplicate
+    if (seq_diff(received_ack, last_ack) <= 0) {
         if (received_ack == last_ack) {
             dup_ack_count++;
             if (dup_ack_count >= DUP_ACKS) {
-                // fast retransmit
-                for (int i = 0; i < send_buffer.count; i++) {
-                    if (ntohs(send_buffer.packets[i].seq) == last_ack) {
-                        retransmit_packet(sockfd, addr, i);
-                        break;
-                    }
+                // Fast retransmit: retransmit the first unacked packet
+                if (send_buffer.count > 0) {
+                    retransmit_packet(sockfd, addr, 0);
                 }
                 dup_ack_count = 0;
             }
@@ -319,81 +342,93 @@ void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack)
         return;
     }
 
-    // new ack
+    // New ack received
     last_ack = received_ack;
     dup_ack_count = 0;
 
-    // remove fully acked packets from send buffer
+    // Remove fully acknowledged packets from send buffer using seq_diff for wrap-around
     while (send_buffer.count > 0) {
-        packet *first_pkt = &send_buffer.packets[0];
+        packet *first_pkt = (packet *)&send_buffer.packets[0];
         uint16_t first_seq = ntohs(first_pkt->seq);
         uint16_t first_len = ntohs(first_pkt->length);
-        if ((first_seq + first_len) <= received_ack) {
+        uint16_t packet_end = (uint16_t)(first_seq + first_len);
+        if (seq_diff(received_ack, packet_end) >= 0) {
             buffer_remove_first(&send_buffer);
         } else {
             break;
         }
     }
+
+    // Reset timer for the oldest unacked packet, if any
+    if (send_buffer.count > 0) {
+        gettimeofday(&send_buffer.times[0], NULL);
+    }
 }
 
+// In process_data, update the shifting loop similarly:
 void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt)
 {
     uint16_t recv_seq = ntohs(pkt->seq);
-    uint16_t recv_len = ntohs(pkt->length);
+uint16_t recv_len = ntohs(pkt->length);
+int16_t diff = seq_diff(recv_seq, ack);
+if (diff == 0) {
+    // in-order: deliver the payload
+    output_p(pkt->payload, recv_len);
 
-    // Normal in-order check
-    if (recv_seq == ack) {
-        // This is exactly the next chunk
-        fprintf(stderr, "Writing packet seq=%hu len=%hu\n", recv_seq, recv_len);
-        output_p(pkt->payload, recv_len);
-        ack += recv_len;
+    // Increase advertised window gradually (by 500 bytes, capped at MAX_WINDOW)
+    if (recv_flow_window < MAX_WINDOW) {
+        uint16_t new_win = recv_flow_window + 500;
+        recv_flow_window = (new_win > MAX_WINDOW) ? MAX_WINDOW : new_win;
+    }
 
-        // Try to see if we can consume buffered out-of-order packets now
-        bool found = true;
-        while (found && recv_buffer.count > 0) {
-            found = false;
-            for (int i = 0; i < recv_buffer.count; i++) {
-                uint16_t buf_seq = ntohs(recv_buffer.packets[i].seq);
-                uint16_t buf_len = ntohs(recv_buffer.packets[i].length);
-                if (buf_seq == ack) {
-                    // deliver it
-                    fprintf(stderr, "Writing buffered seq=%hu len=%hu\n", buf_seq, buf_len);
-                    output_p(recv_buffer.packets[i].payload, buf_len);
-                    ack += buf_len;
-                    // remove from buffer
-                    for (int j = i; j < recv_buffer.count - 1; j++) {
-                        memcpy(&recv_buffer.packets[j],
-                               &recv_buffer.packets[j + 1],
-                               sizeof(packet) + MAX_PAYLOAD);
-                    }
-                    recv_buffer.count--;
-                    found = true;
-                    break;
+    ack = (uint16_t)(ack + recv_len);  // addition modulo 2^16
+    bool found = true;
+    while (found && recv_buffer.count > 0) {
+        found = false;
+        for (int i = 0; i < recv_buffer.count; i++) {
+            uint16_t buf_seq = ntohs(recv_buffer.packets[i].seq);
+            uint16_t buf_len = ntohs(recv_buffer.packets[i].length);
+            if (seq_diff(buf_seq, ack) == 0) {
+                output_p(recv_buffer.packets[i].payload, buf_len);
+
+                if (recv_flow_window < MAX_WINDOW) {
+                    uint16_t new_win = recv_flow_window + 500;
+                    recv_flow_window = (new_win > MAX_WINDOW) ? MAX_WINDOW : new_win;
                 }
+
+
+                ack = (uint16_t)(ack + buf_len);
+                // Shift remaining buffered packets
+                // Shift buffered packets using fixed block size
+for (int j = i; j < recv_buffer.count - 1; j++) {
+    memmove(&recv_buffer.packets[j], &recv_buffer.packets[j + 1], sizeof(full_packet));
+}
+
+                recv_buffer.count--;
+                found = true;
+                break;
             }
         }
     }
-    else if (recv_seq > ack) {
-        // future => buffer
-        if (recv_buffer.count < BUFFER_SIZE) {
-            fprintf(stderr, "Buffering out-of-order seq=%hu\n", recv_seq);
-            memcpy(&recv_buffer.packets[recv_buffer.count], pkt,
-                   sizeof(packet) + recv_len);
-            recv_buffer.count++;
-        }
+} else if (diff > 0) {
+    // Packet is in the future: buffer it
+    if (recv_buffer.count < BUFFER_SIZE) {
+        int pkt_size = sizeof(packet) + recv_len;
+        memcpy(&recv_buffer.packets[recv_buffer.count], pkt, pkt_size);
+        recv_buffer.count++;
     }
-    else {
-        // duplicate or old => re-ACK in case other side needs it
-        fprintf(stderr, "Dropping duplicate/out-of-window seq=%hu\n", recv_seq);
-        packet ack_pkt = {0};
-        ack_pkt.seq = htons(seq);
-        ack_pkt.ack = htons(ack);
-        ack_pkt.length = 0;
-        ack_pkt.win = htons(MAX_WINDOW - recv_buffer.count * MAX_PAYLOAD);
-        ack_pkt.flags = ACK;
-        calculate_parity(&ack_pkt);
-        send_packet(sockfd, addr, &ack_pkt);
-    }
+} else {
+    // Duplicate or old packet: send duplicate ACK
+    packet ack_pkt = {0};
+    ack_pkt.seq = htons(seq);
+    ack_pkt.ack = htons(ack);
+    ack_pkt.length = 0;
+    ack_pkt.win = htons(recv_flow_window);
+    ack_pkt.flags = ACK;
+    calculate_parity(&ack_pkt);
+    send_packet(sockfd, addr, &ack_pkt);
+}
+
 }
 
 // ------------- MAIN LOOP -------------
@@ -411,7 +446,7 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
     // Prepare handshake
     uint16_t local_seq, remote_seq;
     if (!perform_handshake(sockfd, addr, type, &local_seq, &remote_seq)) {
-        fprintf(stderr, "Handshake failed\n");
+       //fprintf(stderr, "Handshake failed\n");
         return;
     }
 
@@ -422,8 +457,9 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
     dup_ack_count = 0;
     send_buffer.count = 0;
     recv_buffer.count = 0;
-    send_buffer.window_size = MIN_WINDOW; // can adapt logic if you want
-    recv_buffer.window_size = MAX_WINDOW;
+    send_buffer.window_size = MIN_WINDOW; // initial sender window
+    recv_buffer.window_size = MAX_WINDOW; // not used now, but kept for symmetry
+    recv_flow_window = MIN_WINDOW;         // initialize our advertised window
 
     // run loop
     struct timeval last_transmission;
@@ -464,7 +500,7 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
                 if (buffer_add(&send_buffer, &send_pkt)) {
                     send_packet(sockfd, addr, &send_pkt);
                     print_diag(&send_pkt, SEND);
-                    seq += bytes_read;
+                    seq = (uint16_t)(seq + bytes_read);
                     gettimeofday(&last_transmission, NULL);
                 }
             }
@@ -477,19 +513,17 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
         if (bytes_received > 0) {
             packet *recv_pkt = (packet *)buffer;
             if (!check_parity(recv_pkt)) {
-                fprintf(stderr, "[%s] Corrupted packet, re-ACK\n",
-                        (type == SERVER ? "SERVER" : "CLIENT"));
-                // Send a duplicate ACK to help peer recover
                 packet ack_pkt = {0};
                 ack_pkt.seq = htons(seq);
                 ack_pkt.ack = htons(ack);
                 ack_pkt.length = 0;
-                ack_pkt.win = htons(MAX_WINDOW - recv_buffer.count * MAX_PAYLOAD);
+                ack_pkt.win = htons(recv_flow_window);
                 ack_pkt.flags = ACK;
                 calculate_parity(&ack_pkt);
                 send_packet(sockfd, addr, &ack_pkt);
                 continue;
             }
+            
 
             print_diag(recv_pkt, RECV);
 
@@ -515,7 +549,7 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
                 ack_pkt.seq = htons(seq);
                 ack_pkt.ack = htons(ack);
                 ack_pkt.length = 0;
-                ack_pkt.win = htons(MAX_WINDOW - recv_buffer.count * MAX_PAYLOAD);
+                ack_pkt.win = htons(recv_flow_window);
                 ack_pkt.flags = ACK;
                 calculate_parity(&ack_pkt);
                 send_packet(sockfd, addr, &ack_pkt);
