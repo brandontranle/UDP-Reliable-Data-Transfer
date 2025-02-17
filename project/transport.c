@@ -25,6 +25,8 @@ uint16_t last_ack = 0;
 int dup_ack_count = 0;
 uint16_t last_retransmit_seq = 0;
 uint16_t recv_flow_window;
+static int g_type = 0;
+
 
 // We store the user-provided function pointers from listen_loop()
 // so we can call them from anywhere in this file.
@@ -87,7 +89,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                 syn_pkt.seq    = htons(*local_init_seq);
                 syn_pkt.ack    = 0;
                 syn_pkt.length = 0;
-                syn_pkt.win    = htons(MAX_WINDOW);
+                syn_pkt.win    = htons(MIN_WINDOW);
                 syn_pkt.flags  = SYN;
                 syn_pkt.unused = 0;
                 calculate_parity(&syn_pkt);
@@ -123,7 +125,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
 
                             // Send final ACK
                             packet ack_pkt = {0};
-                            ack_pkt.seq    = htons((*local_init_seq) + 1);
+                            ack_pkt.seq    = 0;  // set to 0 for pure ACK as per instructions
                             ack_pkt.ack    = htons((*remote_init_seq) + 1);
                             ack_pkt.length = 0;
                             ack_pkt.win    = 0; // per reference logs
@@ -246,13 +248,24 @@ void send_packet(int sockfd, struct sockaddr_in *addr, packet *pkt)
 }
 
 // Add a packet to the send/recv buffer
-static bool buffer_add(Buffer *buf, packet *pkt)
-{
+static bool buffer_add(Buffer *buf, packet *pkt) {
     if (buf->count >= BUFFER_SIZE) 
         return false;
-    size_t pkt_size = sizeof(packet) + ntohs(pkt->length);
-    memcpy(&buf->packets[buf->count], pkt, pkt_size);
-
+    
+    uint16_t pkt_len = ntohs(pkt->length);
+    
+    // Calculate bytes in flight only from unacknowledged packets
+    size_t bytes_in_flight = 0;
+    for (int i = 0; i < buf->count; i++) {
+        bytes_in_flight += ntohs(buf->packets[i].length);
+    }
+    
+    // Check if adding this packet would exceed window
+    if (bytes_in_flight + pkt_len > buf->window_size)
+        return false;
+    
+    // Add packet to buffer
+    memcpy(&buf->packets[buf->count], pkt, sizeof(packet) + pkt_len);
     gettimeofday(&buf->times[buf->count], NULL);
     buf->retransmit_count[buf->count] = 0;
     buf->count++;
@@ -296,154 +309,123 @@ static void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
 }
 
 // -------------- ACK Handling --------------
-static void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack)
-{
-    static uint16_t last_dup_ack_val = 0;
-    static int dup_ack_count_local   = 0;
-
-    // If ack <= last_ack, might be duplicate
-    if (seq_diff(received_ack, last_ack) <= 0) {
-        if (received_ack == last_dup_ack_val)
-            dup_ack_count_local++;
-        else {
-            last_dup_ack_val     = received_ack;
-            dup_ack_count_local  = 1;
-        }
-
-        // If we got 3 duplicates, fast retransmit
-        if (dup_ack_count_local >= DUP_ACKS) {
-            if (send_buffer.count > 0) {
-                // Retransmit the oldest unacked
-                retransmit_packet(sockfd, addr, 0);
-            }
-            dup_ack_count_local  = 0;
-            last_dup_ack_val     = received_ack;
-        }
-        return;
-    }
-
-    // If new ACK > last_ack, then normal
-    last_dup_ack_val    = received_ack;
-    dup_ack_count_local = 0;
-    last_ack            = received_ack;
-
-    // pop from send_buffer anything up to this ack
-    while (send_buffer.count > 0) {
-        packet *first_pkt   = (packet*)&send_buffer.packets[0];
-        uint16_t first_seq  = ntohs(first_pkt->seq);
-        uint16_t first_len  = ntohs(first_pkt->length);
-        uint16_t packet_end = first_seq + first_len; // The seq after last byte in that packet
-
-        if (seq_diff(received_ack, packet_end) >= 0)
-            buffer_remove_first(&send_buffer);
-        else
-            break;
-    }
-
-    // reset timer for first unacked
-    if (send_buffer.count > 0) {
-        gettimeofday(&send_buffer.times[0], NULL);
-    }
-}
-
-// -------------- Data Handling --------------
-static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt)
-{
-    ack_sent = 0;
-
-    uint16_t recv_seq = ntohs(pkt->seq);
-    uint16_t recv_len = ntohs(pkt->length);
-
-    int32_t diff = seq_diff(recv_seq, ack);
-    if (diff == 0) {
-        // In-order data: deliver & bump ack
-        g_output(pkt->payload, recv_len);
-
-        if (recv_flow_window < MAX_WINDOW) {
-            uint16_t new_win = recv_flow_window + 500;
-            if (new_win > MAX_WINDOW) new_win = MAX_WINDOW;
-            recv_flow_window = new_win;
-        }
-        ack = (uint16_t)(ack + recv_len);
-
-        // Check if we can deliver more from buffer
-        bool found = true;
-        while (found && recv_buffer.count > 0) {
-            found = false;
-            for (int i = 0; i < recv_buffer.count; i++) {
-                uint16_t b_seq = ntohs(recv_buffer.packets[i].seq);
-                uint16_t b_len = ntohs(recv_buffer.packets[i].length);
-
-                if (seq_diff(b_seq, ack) == 0) {
-                    g_output(recv_buffer.packets[i].payload, b_len);
-
-                    if (recv_flow_window < MAX_WINDOW) {
-                        uint16_t new_win = recv_flow_window + 500;
-                        if (new_win > MAX_WINDOW) new_win = MAX_WINDOW;
-                        recv_flow_window = new_win;
-                    }
-                    ack = (uint16_t)(ack + b_len);
-
-                    // remove from buffer
-                    for (int j = i; j < recv_buffer.count - 1; j++) {
-                        recv_buffer.packets[j] = recv_buffer.packets[j + 1];
-                    }
-                    recv_buffer.count--;
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
-    else if (diff > 0) {
-        // Future data (out-of-order), buffer it if there's space
-        if (recv_buffer.count < BUFFER_SIZE) {
-            size_t total_size = sizeof(packet) + recv_len;
-            memcpy(&recv_buffer.packets[recv_buffer.count], pkt, total_size);
-            recv_buffer.count++;
-        }
-        // else just drop
-    }
-    else {
-        // Old or duplicate data: send duplicate ACK if not done recently
-        static uint16_t last_dup_ack_sent = 0;
-        static struct timeval last_dup_ack_time = {0};
-
+static void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack) {
+    static uint16_t prev_ack = 0;
+    static int dup_ack_count = 0;
+    static struct timeval last_dup_time = {0, 0};
+    
+    // Ignore duplicate ACKs too close together
+    if (received_ack == prev_ack) {
         struct timeval now;
         gettimeofday(&now, NULL);
-
-        if (last_dup_ack_sent == ack) {
-            // Already sent a duplicate ack with the same ack
-            long tdiff = TV_DIFF(now, last_dup_ack_time);
-            if (tdiff < DUP_ACK_THROTTLE_TIME) {
-                // throttle
-                return;
+        if (TV_DIFF(now, last_dup_time) > DUP_ACK_THROTTLE_TIME) {
+            dup_ack_count++;
+            if (dup_ack_count >= DUP_ACKS && send_buffer.count > 0) {
+                print_diag((packet*)&send_buffer.packets[0], DUPS);
+                retransmit_packet(sockfd, addr, 0);
+                dup_ack_count = 0;
+            }
+            gettimeofday(&last_dup_time, NULL);
+        }
+    } else if (seq_diff(received_ack, prev_ack) > 0) {
+        // New ACK
+        prev_ack = received_ack;
+        dup_ack_count = 0;
+        
+        // Remove acknowledged packets
+        while (send_buffer.count > 0) {
+            packet *pkt = &send_buffer.packets[0];
+            if (seq_diff(received_ack, ntohs(pkt->seq)) > 0) {
+                buffer_remove_first(&send_buffer);
+            } else {
+                break;
             }
         }
-        last_dup_ack_sent = ack;
-        last_dup_ack_time = now;
-
-        // send dup ack
-        packet dup_ack_pkt = {0};
-        dup_ack_pkt.seq    = htons(seq);
-        dup_ack_pkt.ack    = htons(ack);
-        dup_ack_pkt.length = 0;
-        dup_ack_pkt.win    = htons(recv_flow_window);
-        dup_ack_pkt.flags  = ACK;
-        calculate_parity(&dup_ack_pkt);
-
-        send_packet(sockfd, addr, &dup_ack_pkt);
+    }
+}
+// -------------- Data Handling --------------
+static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt) {
+    ack_sent = 0;
+    uint16_t recv_seq = ntohs(pkt->seq);
+    uint16_t recv_len = ntohs(pkt->length);
+    
+    int32_t diff = seq_diff(recv_seq, ack);
+    
+    // Validate the received packet
+    if (recv_len > 0) {  // Only for data packets
+        if (diff == 0) {  // In-order packet
+            // Process the data immediately
+            g_output(pkt->payload, recv_len);
+            ack = (uint16_t)(recv_seq + 1);
+            
+            // Try to process any buffered packets
+            bool processed_buffered = true;
+            while (processed_buffered && recv_buffer.count > 0) {
+                processed_buffered = false;
+                
+                for (int i = 0; i < recv_buffer.count; i++) {
+                    packet *buf_pkt = &recv_buffer.packets[i];
+                    uint16_t buf_seq = ntohs(buf_pkt->seq);
+                    
+                    if (buf_seq == ack) {
+                        // This is the next packet we need
+                        uint16_t buf_len = ntohs(buf_pkt->length);
+                        g_output(buf_pkt->payload, buf_len);
+                        ack = (uint16_t)(buf_seq + 1);
+                        
+                        // Remove this packet from buffer
+                        for (int j = i; j < recv_buffer.count - 1; j++) {
+                            recv_buffer.packets[j] = recv_buffer.packets[j + 1];
+                        }
+                        recv_buffer.count--;
+                        processed_buffered = true;
+                        break;
+                    }
+                }
+            }
+        } else if (diff > 0) {  // Future packet
+            // Buffer it if we have space
+            if (recv_buffer.count < BUFFER_SIZE) {
+                // Insert in sequence order
+                int insert_idx = 0;
+                while (insert_idx < recv_buffer.count) {
+                    if (seq_diff(recv_seq, ntohs(recv_buffer.packets[insert_idx].seq)) < 0) {
+                        break;
+                    }
+                    insert_idx++;
+                }
+                
+                // Make room and insert
+                for (int i = recv_buffer.count; i > insert_idx; i--) {
+                    recv_buffer.packets[i] = recv_buffer.packets[i-1];
+                }
+                memcpy(&recv_buffer.packets[insert_idx], pkt, sizeof(packet) + recv_len);
+                recv_buffer.count++;
+            }
+        }
+    }
+    
+    // Always acknowledge what we've received
+    if (!ack_sent) {
+        packet ack_pkt = {0};
+        ack_pkt.seq = 0;
+        ack_pkt.ack = htons(ack);
+        ack_pkt.length = 0;
+        ack_pkt.win = htons(MAX_WINDOW);  // Always advertise max window
+        ack_pkt.flags = ACK;
+        calculate_parity(&ack_pkt);
+        send_packet(sockfd, addr, &ack_pkt);
+        print_diag(&ack_pkt, SEND);
         ack_sent = 1;
     }
 }
-
-
 // -------------- Main I/O Loop --------------
 void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                  ssize_t (*input_function)(uint8_t*, size_t),
                  void (*output_function)(uint8_t*, size_t))
 {
     // Store function pointers globally
+    g_type = type; // remember whether we're CLIENT or SERVER
     g_input  = input_function;
     g_output = output_function;
 
@@ -465,15 +447,14 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
     seq = local_seq + 1;
     ack = remote_seq + 1;
 
-    last_ack      = 0;
-    dup_ack_count = 0;
+    last_ack = seq;  // Important: initialize last_ack
 
     send_buffer.count = 0;
     recv_buffer.count = 0;
 
     send_buffer.window_size = MIN_WINDOW;
-    recv_buffer.window_size = MAX_WINDOW;
-    recv_flow_window        = MIN_WINDOW;
+    recv_buffer.window_size = MIN_WINDOW;
+    recv_flow_window = MIN_WINDOW;
 
     struct timeval last_transmission;
     gettimeofday(&last_transmission, NULL);
@@ -488,39 +469,37 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
         gettimeofday(&now, NULL);
 
         // 1) Possibly send new data if window allows
-        size_t bytes_in_flight = 0;
-        for (int i = 0; i < send_buffer.count; i++) {
-            bytes_in_flight += ntohs(send_buffer.packets[i].length);
-        }
-        if (bytes_in_flight < send_buffer.window_size) {
-            size_t can_send = send_buffer.window_size - bytes_in_flight;
-            if (can_send > MAX_PAYLOAD) {
-                can_send = MAX_PAYLOAD;
-            }
-            // read from user's input function
-            uint8_t data[MAX_PAYLOAD];
-            ssize_t bytes_read = g_input(data, can_send);
-            if (bytes_read > 0) {
-                // Build a data+ACK packet
-                packet send_pkt = {0};
-                send_pkt.seq  = htons(seq);
-                send_pkt.ack  = htons(ack);
-                send_pkt.length = htons(bytes_read);
-                send_pkt.win  = htons(recv_flow_window);
-                send_pkt.flags= ACK;
-                memcpy(send_pkt.payload, data, bytes_read);
-
-                calculate_parity(&send_pkt);
-                if (buffer_add(&send_buffer, &send_pkt)) {
-                    // actually send
-                    send_packet(sockfd, addr, &send_pkt);
-                    print_diag(&send_pkt, SEND);
-
-                    seq = (uint16_t)(seq + bytes_read);
-                    gettimeofday(&last_transmission, NULL);
+                // 1) Possibly send new data if window allows
+                size_t bytes_in_flight = 0;
+                for (int i = 0; i < send_buffer.count; i++) {
+                    bytes_in_flight += ntohs(send_buffer.packets[i].length);
                 }
-            }
-        }
+                if (bytes_in_flight < send_buffer.window_size) {
+                    size_t can_send = send_buffer.window_size - bytes_in_flight;
+                    if (can_send > MAX_PAYLOAD)
+                        can_send = MAX_PAYLOAD;
+                    
+                    uint8_t data[MAX_PAYLOAD];
+                    ssize_t bytes_read = g_input(data, can_send);
+                    if (bytes_read > 0) {
+                        packet send_pkt = {0};
+                        send_pkt.seq = htons(seq);
+                        send_pkt.ack = htons(ack);
+                        send_pkt.length = htons(bytes_read);
+                        send_pkt.win = htons(recv_flow_window);
+                        send_pkt.flags = ACK;
+                        memcpy(send_pkt.payload, data, bytes_read);
+                
+                        calculate_parity(&send_pkt);
+                        if (buffer_add(&send_buffer, &send_pkt)) {
+                            send_packet(sockfd, addr, &send_pkt);
+                            print_diag(&send_pkt, SEND);
+                            seq = (uint16_t)(seq + 1);
+                            gettimeofday(&last_transmission, NULL);
+                        }
+                    }
+                }
+        
 
         // 2) Read incoming
         addr_size = sizeof(peer_addr);
@@ -547,12 +526,12 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             // handle ack
             if (recv_pkt->flags & ACK) {
                 process_ack(sockfd, addr, ntohs(recv_pkt->ack));
-
-                // update local window based on their Flow Window
+            
+                // Update send window based on receiver's advertised window
                 uint16_t new_win = ntohs(recv_pkt->win);
-                if (new_win < MIN_WINDOW) new_win = MIN_WINDOW;
-                if (new_win > MAX_WINDOW) new_win = MAX_WINDOW;
-                send_buffer.window_size = new_win;
+                if (new_win >= MIN_WINDOW) {
+                    send_buffer.window_size = new_win;
+                }
             }
             // handle data
             if (ntohs(recv_pkt->length) > 0) {
@@ -561,15 +540,16 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 // If we haven't already sent an ACK,
                 // we do so now
                 if (!ack_sent) {
-                    packet data_ack = {0};
-                    data_ack.seq    = htons(seq);
-                    data_ack.ack    = htons(ack);
-                    data_ack.length = 0;
-                    data_ack.win    = htons(recv_flow_window);
-                    data_ack.flags  = ACK;
-                    calculate_parity(&data_ack);
-                    send_packet(sockfd, addr, &data_ack);
-                    print_diag(&data_ack, SEND);
+                    packet ack_pkt = {0};
+                    ack_pkt.seq = 0;  // Always 0 for pure ACKs per professor's note
+                    ack_pkt.ack = htons(ack);
+                    ack_pkt.length = 0;
+                    ack_pkt.win = htons(recv_flow_window);
+                    ack_pkt.flags = ACK;
+                    calculate_parity(&ack_pkt);
+                    send_packet(sockfd, addr, &ack_pkt);
+                    print_diag(&ack_pkt, SEND);
+                    ack_sent = 1;
                 }
             }
         }
