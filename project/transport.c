@@ -175,6 +175,10 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
 
                 if (handshake_state == HS_INIT && (recv_pkt->flags & SYN)) {
                     // Send SYN+ACK
+                     // Process any piggybacked data in the SYN packet 
+                     uint16_t payload_len = ntohs(recv_pkt->length); 
+                     if (payload_len > 0) { g_output(recv_pkt->payload, payload_len); }
+
                     *remote_init_seq = ntohs(recv_pkt->seq);
 
                     packet synack_pkt = {0};
