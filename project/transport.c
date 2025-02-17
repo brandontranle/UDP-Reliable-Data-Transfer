@@ -310,26 +310,12 @@ static void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
 
 // -------------- ACK Handling --------------
 static void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_ack) {
-    static uint16_t prev_ack = 0;
-    static int dup_ack_count = 0;
-    static struct timeval last_dup_time = {0, 0};
+    if (send_buffer.count == 0) return;
     
-    // Ignore duplicate ACKs too close together
-    if (received_ack == prev_ack) {
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        if (TV_DIFF(now, last_dup_time) > DUP_ACK_THROTTLE_TIME) {
-            dup_ack_count++;
-            if (dup_ack_count >= DUP_ACKS && send_buffer.count > 0) {
-                print_diag((packet*)&send_buffer.packets[0], DUPS);
-                retransmit_packet(sockfd, addr, 0);
-                dup_ack_count = 0;
-            }
-            gettimeofday(&last_dup_time, NULL);
-        }
-    } else if (seq_diff(received_ack, prev_ack) > 0) {
-        // New ACK
-        prev_ack = received_ack;
+    int32_t diff = seq_diff(received_ack, last_ack);
+    if (diff > 0) {
+        // Valid new ACK
+        last_ack = received_ack;
         dup_ack_count = 0;
         
         // Remove acknowledged packets
@@ -341,6 +327,14 @@ static void process_ack(int sockfd, struct sockaddr_in *addr, uint16_t received_
                 break;
             }
         }
+    } else if (diff == 0) {
+        // Duplicate ACK
+        dup_ack_count++;
+        if (dup_ack_count >= DUP_ACKS) {
+            print_diag(&send_buffer.packets[0], DUPS);
+            retransmit_packet(sockfd, addr, 0);
+            dup_ack_count = 0;
+        }
     }
 }
 // -------------- Data Handling --------------
@@ -349,69 +343,67 @@ static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt) {
     uint16_t recv_seq = ntohs(pkt->seq);
     uint16_t recv_len = ntohs(pkt->length);
     
+    // Get the difference between received sequence and expected
     int32_t diff = seq_diff(recv_seq, ack);
     
-    // Validate the received packet
-    if (recv_len > 0) {  // Only for data packets
-        if (diff == 0) {  // In-order packet
-            // Process the data immediately
-            g_output(pkt->payload, recv_len);
-            ack = (uint16_t)(recv_seq + 1);
-            
-            // Try to process any buffered packets
-            bool processed_buffered = true;
-            while (processed_buffered && recv_buffer.count > 0) {
-                processed_buffered = false;
+    if (diff == 0) {  // In-order packet
+        // Process current packet
+        g_output(pkt->payload, recv_len);
+        ack = (uint16_t)(recv_seq + 1);
+        
+        // Process buffered packets in order
+        bool made_progress = true;
+        while (made_progress && recv_buffer.count > 0) {
+            made_progress = false;
+            for (int i = 0; i < recv_buffer.count; i++) {
+                packet *buf_pkt = &recv_buffer.packets[i];
+                uint16_t buf_seq = ntohs(buf_pkt->seq);
                 
-                for (int i = 0; i < recv_buffer.count; i++) {
-                    packet *buf_pkt = &recv_buffer.packets[i];
-                    uint16_t buf_seq = ntohs(buf_pkt->seq);
+                if (buf_seq == ack) {
+                    // Found next packet in sequence
+                    g_output(buf_pkt->payload, ntohs(buf_pkt->length));
+                    ack = (uint16_t)(buf_seq + 1);
                     
-                    if (buf_seq == ack) {
-                        // This is the next packet we need
-                        uint16_t buf_len = ntohs(buf_pkt->length);
-                        g_output(buf_pkt->payload, buf_len);
-                        ack = (uint16_t)(buf_seq + 1);
-                        
-                        // Remove this packet from buffer
-                        for (int j = i; j < recv_buffer.count - 1; j++) {
-                            recv_buffer.packets[j] = recv_buffer.packets[j + 1];
-                        }
-                        recv_buffer.count--;
-                        processed_buffered = true;
-                        break;
-                    }
+                    // Remove processed packet
+                    memmove(&recv_buffer.packets[i], 
+                           &recv_buffer.packets[i + 1],
+                           (recv_buffer.count - i - 1) * sizeof(full_packet));
+                    recv_buffer.count--;
+                    made_progress = true;
+                    break;
                 }
             }
-        } else if (diff > 0) {  // Future packet
-            // Buffer it if we have space
-            if (recv_buffer.count < BUFFER_SIZE) {
-                // Insert in sequence order
-                int insert_idx = 0;
-                while (insert_idx < recv_buffer.count) {
-                    if (seq_diff(recv_seq, ntohs(recv_buffer.packets[insert_idx].seq)) < 0) {
-                        break;
-                    }
-                    insert_idx++;
-                }
-                
-                // Make room and insert
-                for (int i = recv_buffer.count; i > insert_idx; i--) {
-                    recv_buffer.packets[i] = recv_buffer.packets[i-1];
-                }
-                memcpy(&recv_buffer.packets[insert_idx], pkt, sizeof(packet) + recv_len);
-                recv_buffer.count++;
-            }
+        }
+    } else if (diff > 0) {  // Future packet
+        // Store in buffer, maintaining sequence order
+        int insert_pos = 0;
+        while (insert_pos < recv_buffer.count) {
+            uint16_t buf_seq = ntohs(recv_buffer.packets[insert_pos].seq);
+            if (seq_diff(recv_seq, buf_seq) < 0)
+                break;
+            insert_pos++;
+        }
+        
+        if (insert_pos < BUFFER_SIZE) {
+            // Make room for new packet
+            memmove(&recv_buffer.packets[insert_pos + 1],
+                   &recv_buffer.packets[insert_pos],
+                   (recv_buffer.count - insert_pos) * sizeof(full_packet));
+            
+            // Insert new packet
+            memcpy(&recv_buffer.packets[insert_pos], pkt, 
+                   sizeof(packet) + recv_len);
+            recv_buffer.count++;
         }
     }
     
-    // Always acknowledge what we've received
+    // Send acknowledgment
     if (!ack_sent) {
         packet ack_pkt = {0};
         ack_pkt.seq = 0;
         ack_pkt.ack = htons(ack);
         ack_pkt.length = 0;
-        ack_pkt.win = htons(MAX_WINDOW);  // Always advertise max window
+        ack_pkt.win = htons(MAX_WINDOW);
         ack_pkt.flags = ACK;
         calculate_parity(&ack_pkt);
         send_packet(sockfd, addr, &ack_pkt);
