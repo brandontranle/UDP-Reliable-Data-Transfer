@@ -451,6 +451,11 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
+    // Make stdin non-blocking
+    flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+
+
     uint16_t local_seq, remote_seq;
     if (!perform_handshake(sockfd, addr, type, &local_seq, &remote_seq)) {
         return; // handshake failed
