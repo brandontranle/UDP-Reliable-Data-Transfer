@@ -123,9 +123,15 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                         if ((recv_pkt->flags & (SYN | ACK)) == (SYN | ACK)) {
                             *remote_init_seq = ntohs(recv_pkt->seq);
 
-                            // Send final ACK
+                            // Process any piggybacked data from the SYN|ACK packet
+                            uint16_t payload_len = ntohs(recv_pkt->length);
+                            if (payload_len > 0) {
+                                g_output(recv_pkt->payload, payload_len);
+                            }
+
+                            // Send final ACK (pure ACK)
                             packet ack_pkt = {0};
-                            ack_pkt.seq    = 0;  // set to 0 for pure ACK as per instructions
+                            ack_pkt.seq    = 0;  // pure ACK per spec
                             ack_pkt.ack    = htons((*remote_init_seq) + 1);
                             ack_pkt.length = 0;
                             ack_pkt.win    = 0; // per reference logs
@@ -135,6 +141,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                             send_packet(sockfd, addr, &ack_pkt);
 
                             handshake_state = HS_ESTABLISHED;
+
                         }
                     }
                 }
