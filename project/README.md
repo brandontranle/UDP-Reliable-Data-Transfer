@@ -1,9 +1,13 @@
-# Description of Work (10 points)
+# Our Thought Process
+## Design
+The implementation started with a three-way handshake mechanism, focusing on establishing a reliable connection between client and server. The core design centered around implementing global tracking of sequence numbers and acknowledgments, which proved crucial for maintaining packet order and reliability. At first, we tried to implement the handshake to work inside the listen_loop; however, we figured it would be better to keep this implementation modular. Thus, we made `perform_handshake` to keep this separated from packet processing. However, we came to realizer that after finishing the project it would have been a lot easier to configure handshakes as part of the packet processing mechanism in our `listen_loop`. 
 
-This is new for Project 1. We ask you to include a file called `README.md` that contains a quick description of:
+In terms of reliability, we implemented fast retransmit to quickly recover from packet loss, which would activate after receiving 3 duplicate ACKs. Furthermore, we utilized the `bit_count` function inside of `consts.h` to create a easy implementation of checksums / integrity checking using parity bits. Another decision we made was to create a windowing mechanism that managed flow control between the sender and receiver. We did this by setting a minimum window size equal to the maximum segment size (MSS) and a maximum window size as a multiple of the MSS. This ultimately ensured that the sender would not overwhelm the receiver and would only transmit when it was permitted by the receiver’s advertised flow window. 
 
-1. the design choices you made,
-2. any problems you encountered while creating your solution, and
-3. your solutions to those problems.
 
-This is not meant to be comprehensive; less than 300 words will suffice.
+## Major Challenges
+Initially, a circular queue approach was considered but proved too complex. Instead, a more straightforward Buffer struct was implemented with a maximum buffer size of 40 packets. This structure allowed for more predictable packet management and easier debugging. 
+
+Another challenge was integrating handshake payload management with our main data transfer. We discovered that if payload data carried in the handshake was not correctly processed on both sides, exactly one MSS of data would be dropped. For instance, our initial design resulted in receiving only 8988 bytes instead of 10000 bytes, indicating that the handshake payload was being lost. By modifying the server’s handshake logic to output any piggybacked payload from the final ACK and adjusting sequence numbers accordingly, we resolved this issue. A critical insight came from carefully reviewing connection logs to which we discovered that the reference solutions were actually performing payload transmission during the handshake process. This led to us mimicking both ref client and ref server to detect and process piggybacked data during SYN, SYN-ACK, and FINAL-ACK packets.
+
+We also had issues with packet-based sequencing. It got a bit confusing and we had many mishaps in our code where we actually used byte-sized sequencing (which is actually TCP). So, we made a way of tracking packet-based sequencing using two sequence variables, `local_seq` and `remote_seq` which correspond to the local client/server and the remote client/server. These numbers are used in hand with our handshake function to properly track seq numbers after payload trades in the three-way handshake sequence.
