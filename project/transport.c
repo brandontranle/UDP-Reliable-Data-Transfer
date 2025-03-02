@@ -72,6 +72,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
     timeout.tv_usec = 0;
 
     while (handshake_state != HS_ESTABLISHED) {
+        // ------ CLIENT ------
         if (type == CLIENT) {
             if (handshake_state == HS_INIT) {
                 // Send SYN
@@ -80,6 +81,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                 syn_pkt.ack = 0;
                 uint8_t payload[MAX_PAYLOAD] = {0};
                 ssize_t bytes_read = 0;
+                // Handles piggybacked data in SYN
                 if (g_input) {
                     bytes_read = g_input(payload, MAX_PAYLOAD);
                     if (bytes_read > 0) {
@@ -117,10 +119,11 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                         print_diag(recv_pkt, RECV);
                         if (!check_parity(recv_pkt))
                             continue;
-                        // Looking for (SYN|ACK)
+                        // Looking for SYN+ACK
                         if ((recv_pkt->flags & (SYN | ACK)) == (SYN | ACK)) {
                             *remote_init_seq = ntohs(recv_pkt->seq);
                             uint16_t payload_len = ntohs(recv_pkt->length);
+                            // Extracts piggybacked data from SYN+ACK
                             if (payload_len > 0)
                                 g_output(recv_pkt->payload, payload_len);
                             // Send final ACK with data if available, using packet-based sequencing.
@@ -132,7 +135,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                                 if (bytes_read > 0) {
                                     memcpy(ack_pkt.payload, payload, bytes_read);
                                     ack_pkt.length = htons(bytes_read);
-                                    // Consume one packet number
+                                    // Increment sequence number if data is sent
                                     ack_pkt.seq = htons(*local_init_seq + 1);
                                     *local_init_seq = *local_init_seq + 1;
                                 } else {
@@ -154,9 +157,11 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                         }
                     }
                 }
-                // Retransmit SYN if timeout
+                // ------ Retransmit SYN if timeout ------
                 struct timeval now;
                 gettimeofday(&now, NULL);
+                // compare current time with time SYN was sent
+                // if more than 1 econd, retransmit
                 if (TV_DIFF(now, timeout) >= RTO) {
                     packet syn_pkt = {0};
                     syn_pkt.seq = htons(*local_init_seq);
@@ -183,7 +188,8 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                     gettimeofday(&timeout, NULL);
                 }
             }
-        } else { // SERVER
+         // ------ SERVER ------
+        } else { 
             addr_size = sizeof(peer_addr);
             int bytes_received = recvfrom(sockfd, buffer, sizeof(buffer), 0,
                                           (struct sockaddr *)&peer_addr, &addr_size);
@@ -192,6 +198,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                 print_diag(recv_pkt, RECV);
                 if (!check_parity(recv_pkt))
                     continue;
+                // If server receives SYN, start handshake
                 if (handshake_state == HS_INIT && (recv_pkt->flags & SYN)) {
                     // Process piggybacked data from client's SYN
                     uint16_t payload_len = ntohs(recv_pkt->length);
@@ -222,6 +229,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                     handshake_state = HS_SYN_RECEIVED;
                     gettimeofday(&timeout, NULL);
                 }
+                // If server receives final ACK, finish handshake
                 else if (handshake_state == HS_SYN_RECEIVED && (recv_pkt->flags & ACK)) {
                     uint16_t their_ack = ntohs(recv_pkt->ack);
                     // Process final ACK. If it carries payload, output it and update sequence.
@@ -235,6 +243,7 @@ bool perform_handshake(int sockfd, struct sockaddr_in *addr, int type,
                     }
                 }
             }
+            // Reset the handshake if timeout
             if (handshake_state == HS_SYN_RECEIVED) {
                 struct timeval now;
                 gettimeofday(&now, NULL);
@@ -255,26 +264,26 @@ typedef struct {
     uint16_t win;
     uint16_t flags;
     uint16_t unused;
-    uint8_t  payload[MAX_PAYLOAD]; //we're gonna use this instead since consts.h has an empty payload packet def.
+    uint8_t  payload[MAX_PAYLOAD]; // Use this instead since consts.h has an empty payload packet def.
 } full_packet;
 
 typedef struct {
     full_packet packets[BUFFER_SIZE];
     struct timeval times[BUFFER_SIZE];
     int retransmit_count[BUFFER_SIZE];
-    int count;
-    uint16_t window_start;
-    uint16_t window_size;
+    int count; // number of packets currently in buffer
+    uint16_t window_start;  // starting seq number for window
+    uint16_t window_size; // max allowed unacked data
 } Buffer;
 
-static Buffer send_buffer = { .count = 0, .window_start = 0, .window_size = MAX_WINDOW };
-static Buffer recv_buffer = { .count = 0, .window_start = 0, .window_size = MAX_WINDOW };
+static Buffer send_buffer = { .count = 0, .window_start = 0, .window_size = MAX_WINDOW }; // stores packets waiting for ack
+static Buffer recv_buffer = { .count = 0, .window_start = 0, .window_size = MAX_WINDOW }; // stores packets waiting to be delivered in order
 
 void calculate_parity(packet *pkt) {
-    pkt->flags &= ~PARITY;
+    pkt->flags &= ~PARITY; // clear parity bit
     int ones = bit_count(pkt);
     if (ones % 2 != 0)
-        pkt->flags |= PARITY;
+        pkt->flags |= PARITY; // set parity bit if odd
 }
 
 bool check_parity(packet *pkt) {
@@ -283,17 +292,21 @@ bool check_parity(packet *pkt) {
 
 void send_packet(int sockfd, struct sockaddr_in *addr, packet *pkt)
 {
-    size_t total_size = sizeof(packet) + ntohs(pkt->length);
+    size_t total_size = sizeof(packet) + ntohs(pkt->length); // total size = header + payload
     sendto(sockfd, pkt, total_size, 0, (struct sockaddr *)addr, sizeof(*addr));
 }
 
+// adding packet to buffer
 static bool buffer_add(Buffer *buf, packet *pkt) {
+    // if buffer is full return
     if (buf->count >= BUFFER_SIZE)
         return false;
     uint16_t pkt_len = ntohs(pkt->length);
+    // iterate through all packets in buffer and calculate bytes in flight
     size_t bytes_in_flight = 0;
     for (int i = 0; i < buf->count; i++)
         bytes_in_flight += ntohs(buf->packets[i].length);
+    // can't send too much unacked data at once
     if (bytes_in_flight + pkt_len > buf->window_size)
         return false;
     memcpy(&buf->packets[buf->count], pkt, sizeof(packet) + pkt_len);
@@ -303,10 +316,13 @@ static bool buffer_add(Buffer *buf, packet *pkt) {
     return true;
 }
 
+// removing oldest packet from buffer
 static void buffer_remove_first(Buffer *buf)
 {
+    // can't remove
     if (buf->count <= 0)
         return;
+    // shift all packets to the left
     for (int i = 0; i < buf->count - 1; i++) {
         buf->packets[i] = buf->packets[i + 1];
         buf->times[i] = buf->times[i + 1];
@@ -315,7 +331,7 @@ static void buffer_remove_first(Buffer *buf)
     buf->count--;
 }
 
-// ---- PACKET PROCESSING STUFF 
+// ------ PACKET PROCESSING STUFF ------
 
 static void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
 {
@@ -323,8 +339,10 @@ static void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
         return;
     packet *pkt = (packet *)&send_buffer.packets[index];
     uint16_t seq_num = ntohs(pkt->seq);
+    // if packet is already acked, don't retransmit
     if ((seq_num + 1) <= last_ack)
         return;
+    // if retransmit count is less than max, retransmit
     if (send_buffer.retransmit_count[index] < MAX_RETRANSMIT_ATTEMPTS) {
         print_diag(pkt, RTOS);
         send_packet(sockfd, addr, pkt);
@@ -336,14 +354,19 @@ static void retransmit_packet(int sockfd, struct sockaddr_in *addr, int index)
 static void process_ack(int sockfd, struct sockaddr_in *addr, packet *recv_pkt) {
     uint16_t received_ack = ntohs(recv_pkt->ack);
     uint16_t received_win = ntohs(recv_pkt->win);
+    // update window size
     if (received_win >= MIN_WINDOW)
+    // if buffer is empty, return
         send_buffer.window_size = received_win;
     if (send_buffer.count == 0)
         return;
+    // calculate difference between received ack and last ack
     int32_t diff = seq_diff(received_ack, last_ack);
+    // new data is acked
     if (diff > 0) {
         last_ack = received_ack;
         dup_ack_count = 0;
+        // remove acked packets from buffer
         while (send_buffer.count > 0) {
             packet *pkt = (packet *)&send_buffer.packets[0];
             uint16_t seq_num = ntohs(pkt->seq);
@@ -352,9 +375,11 @@ static void process_ack(int sockfd, struct sockaddr_in *addr, packet *recv_pkt) 
             else
                 break;
         }
+    // duplicate ack
     } else if (diff == 0) {
         dup_ack_count++;
         if (dup_ack_count >= DUP_ACKS) {
+            // retransmit oldest unacked packet
             if (send_buffer.count > 0) {
                 packet *pkt = (packet *)&send_buffer.packets[0];
                 print_diag(pkt, DUPS);
