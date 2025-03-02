@@ -394,15 +394,21 @@ static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt) {
     ack_sent = 0;
     uint16_t recv_seq = ntohs(pkt->seq);
     uint16_t recv_len = ntohs(pkt->length);
+    // if an ack, process ack
     if (recv_seq == 0) {
         process_ack(sockfd, addr, pkt);
         return;
     }
+    // it is a seq 
+    // check packet order
     int32_t diff = seq_diff(recv_seq, ack);
+    // if packet is in order, deliver it
     if (diff == 0) {
         if (recv_len > 0)
             g_output(pkt->payload, recv_len);
         ack = (uint16_t)(recv_seq + 1);
+        // checks buffer for next expected packet
+        // if found: deliver, remove from bufer, update ack, and repeat
         bool made_progress = true;
         while (made_progress && recv_buffer.count > 0) {
             made_progress = false;
@@ -423,11 +429,14 @@ static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt) {
                 }
             }
         }
+    // out of order packet, buffer it for later processing
     } else if (diff > 0) {
+        // scans buffer to see if same packet is already stored, if it is send ack
         for (int i = 0; i < recv_buffer.count; i++) {
             if (ntohs(recv_buffer.packets[i].seq) == recv_seq)
                 goto send_ack;
         }
+        // find position to insert in buffer
         int insert_pos = 0;
         while (insert_pos < recv_buffer.count) {
             uint16_t buf_seq = ntohs(recv_buffer.packets[insert_pos].seq);
@@ -435,6 +444,7 @@ static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt) {
                 break;
             insert_pos++;
         }
+        // insert out-of-order packet correctly in buffer and shift existing packet to the right
         if (insert_pos < BUFFER_SIZE) {
             if (recv_buffer.count < BUFFER_SIZE) {
                 memmove(&recv_buffer.packets[insert_pos + 1],
@@ -452,6 +462,7 @@ static void process_data(int sockfd, struct sockaddr_in *addr, packet *pkt) {
             }
         }
     }
+// if packet is ack, process the ack and send it if it hasn't been sent yet
 send_ack:
     if (pkt->flags & ACK)
         process_ack(sockfd, addr, pkt);
@@ -469,8 +480,10 @@ send_ack:
     }
 }
 
+// ------ MAIN LOOP ------
 void listen_loop(int sockfd, struct sockaddr_in* addr, int type, ssize_t (*input_p)(uint8_t*, size_t), void (*output_p)(uint8_t*, size_t))
 {
+    // set to nonblocking adhoc
     g_input = input_p;
     g_output = output_p;
     int flags = fcntl(sockfd, F_GETFL, 0);
@@ -478,10 +491,11 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type, ssize_t (*input
     flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     uint16_t local_seq, remote_seq;
+
+    // perform handshake
     if (!perform_handshake(sockfd, addr, type, &local_seq, &remote_seq))
         return;
-
-    //based on the data exchange in the hanshake!
+    // based on the data exchange in the handshake
     seq = local_seq + 1;
     last_ack = seq;
     ack = remote_seq + 1;
@@ -500,10 +514,12 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type, ssize_t (*input
         struct timeval now;
         gettimeofday(&now, NULL);
         addr_size = sizeof(peer_addr);
+        // check for incoming packet
         int bytes_received = recvfrom(sockfd, buffer, sizeof(buffer), 0,
                                       (struct sockaddr*)&peer_addr, &addr_size);
         if (bytes_received > 0) {
             packet *recv_pkt = (packet*)buffer;
+            // send ack for last correctly received packet
             if (!check_parity(recv_pkt)) {
                 packet ack_pkt = {0};
                 ack_pkt.seq = 0;
@@ -516,11 +532,12 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type, ssize_t (*input
                 continue;
             }
             print_diag(recv_pkt, RECV);
-            process_data(sockfd, addr, recv_pkt);
+            process_data(sockfd, addr, recv_pkt); // deliver in-order packets and buffer out-of-order packets
         }
         size_t bytes_in_flight = 0;
         for (int i = 0; i < send_buffer.count; i++)
             bytes_in_flight += ntohs(send_buffer.packets[i].length);
+        // if allowed, read new data and send packet
         if (bytes_in_flight < send_buffer.window_size && send_buffer.count < BUFFER_SIZE) {
             size_t can_send = send_buffer.window_size - bytes_in_flight;
             if (can_send > MAX_PAYLOAD)
@@ -545,6 +562,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type, ssize_t (*input
             }
         }
         gettimeofday(&now, NULL);
+        // retransmit packets if RTO
         for (int i = 0; i < send_buffer.count; i++) {
             long elapsed = TV_DIFF(now, send_buffer.times[i]);
             if (elapsed >= RTO) {
@@ -552,6 +570,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type, ssize_t (*input
                 gettimeofday(&last_transmission, NULL);
             }
         }
+        // periodic ack sending to prevent timeout even when no new data (mainains connection)
         long since_last_transmission = TV_DIFF(now, last_transmission);
         if (since_last_transmission > RTO / 2 && send_buffer.count > 0) {
             packet ack_pkt = {0};
